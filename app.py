@@ -6,13 +6,14 @@ import os
 import logging
 import base64
 import asyncio
+import hashlib
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from PIL import Image
 import io
 
-# sentence-transformers
 from sentence_transformers import SentenceTransformer
-# torch for image embeddings
 import torch
 import torchvision.transforms as transforms
 from torchvision import models
@@ -22,28 +23,53 @@ app = FastAPI(title="Embedding Service")
 
 MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 NORMALIZE = os.environ.get("EMBEDDING_NORMALIZE", "1") == "1"
-
 ALLOWED_IMAGE_DIR = os.path.abspath(os.environ.get("ALLOWED_IMAGE_DIR", "/app/files"))
+
+# P: выделенный thread pool для inference.
+# Дефолт 2 — не перегружает CPU при параллельных запросах.
+_INFERENCE_WORKERS = int(os.environ.get("INFERENCE_WORKERS", "2"))
+_executor = ThreadPoolExecutor(max_workers=_INFERENCE_WORKERS)
+
+# P: LRU-кэш для текстовых эмбеддингов.
+# Поисковые запросы часто повторяются — кэш даёт O(1) вместо forward pass (~50ms).
+class _LRUCache:
+    def __init__(self, maxsize: int = 512):
+        self._d: OrderedDict = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(self, key: str):
+        if key not in self._d:
+            return None
+        self._d.move_to_end(key)
+        return self._d[key]
+
+    def put(self, key: str, value):
+        if key in self._d:
+            self._d.move_to_end(key)
+        self._d[key] = value
+        if len(self._d) > self._maxsize:
+            self._d.popitem(last=False)
+
+_embed_cache = _LRUCache(maxsize=int(os.environ.get("EMBED_CACHE_SIZE", "512")))
 
 # Load models
 print("Loading text model:", MODEL_NAME)
 text_model = SentenceTransformer(MODEL_NAME)
 print("Text model loaded.")
 
-# Load image model (ResNet for image embeddings)
 print("Loading image model...")
 image_model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 image_model.eval()
-# Remove final classification layer for feature extraction (output: 2048D)
+# Remove final classification layer — output: 2048D
 image_model = torch.nn.Sequential(*list(image_model.children())[:-1])
 print("Image model loaded.")
 
-# Image preprocessing
 image_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
+
 
 class EmbedRequest(BaseModel):
     text: str
@@ -55,12 +81,13 @@ class EmbedResponse(BaseModel):
 
 class ImageEmbedRequest(BaseModel):
     image_path: Optional[str] = None
-    image_data: Optional[str] = None  # base64 encoded (предпочтительный способ)
+    image_data: Optional[str] = None  # base64 (предпочтительный способ)
     size: Optional[int] = 512
 
 class ImageEmbedResponse(BaseModel):
     embedding: List[float]
     size: int
+
 
 def normalize_vec(v: np.ndarray) -> list:
     norm = np.linalg.norm(v)
@@ -76,32 +103,54 @@ def _run_image_inference(image_tensor: torch.Tensor) -> np.ndarray:
         features = image_model(image_tensor)
     return features.squeeze().numpy()
 
+
+@app.on_event("startup")
+async def warmup():
+    """Прогрев моделей при старте — первый реальный запрос не будет медленным."""
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(_executor, partial(_run_text_inference, "warmup"))
+        dummy = torch.zeros(1, 3, 224, 224)
+        await loop.run_in_executor(_executor, partial(_run_image_inference, dummy))
+        logger.info("Models warmed up.")
+    except Exception as e:
+        logger.warning("Warmup failed (non-critical): %s", e)
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "cache_size": len(_embed_cache._d)}
+
 
 @app.post("/embed", response_model=EmbedResponse)
 async def embed_text(req: EmbedRequest):
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty text")
     try:
-        loop = asyncio.get_event_loop()
-        vec_raw = await loop.run_in_executor(None, partial(_run_text_inference, req.text))
+        # P: проверяем кэш перед inference
+        cache_key = hashlib.md5(req.text.encode("utf-8")).hexdigest()
+        cached = _embed_cache.get(cache_key)
+        if cached is not None:
+            return {"embedding": cached, "size": len(cached)}
+
+        # P: get_running_loop() вместо устаревшего get_event_loop()
+        loop = asyncio.get_running_loop()
+        vec_raw = await loop.run_in_executor(_executor, partial(_run_text_inference, req.text))
         vec = normalize_vec(np.array(vec_raw)) if NORMALIZE else np.array(vec_raw).tolist()
+        final = vec.tolist() if isinstance(vec, np.ndarray) else vec
 
-
-        if req.size and req.size != len(vec):
+        if req.size and req.size != len(final):
             logger.warning(
-                "Text embedding size mismatch: model produces %d, requested %d. "
-                "Returning actual model size to avoid corrupting vector index.",
-                len(vec), req.size
+                "Text embedding size mismatch: model=%d, requested=%d. Returning model size.",
+                len(final), req.size
             )
 
-        final = vec.tolist() if isinstance(vec, np.ndarray) else vec
+        _embed_cache.put(cache_key, final)
         return {"embedding": final, "size": len(final)}
     except Exception as e:
         logger.exception("Text embedding failed")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/embed-image", response_model=ImageEmbedResponse)
 async def embed_image(req: ImageEmbedRequest):
@@ -124,15 +173,16 @@ async def embed_image(req: ImageEmbedRequest):
 
         image_tensor = image_transform(image).unsqueeze(0)
 
-        loop = asyncio.get_event_loop()
-        features = await loop.run_in_executor(None, partial(_run_image_inference, image_tensor))
+        # P: get_running_loop() вместо get_event_loop()
+        loop = asyncio.get_running_loop()
+        features = await loop.run_in_executor(_executor, partial(_run_image_inference, image_tensor))
 
         embedding = normalize_vec(features) if NORMALIZE else features.tolist()
 
         if req.size and req.size != len(embedding):
             logger.warning(
-                "Image embedding size mismatch: model produces %d, requested %d. "
-                "Returning actual model size. Update Qdrant collection to %d dimensions.",
+                "Image embedding: model=%d, requested=%d. Returning model size. "
+                "Update Qdrant collection to %d dimensions.",
                 len(embedding), req.size, len(embedding)
             )
 
@@ -142,6 +192,7 @@ async def embed_image(req: ImageEmbedRequest):
     except Exception as e:
         logger.exception("Image embedding failed")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
