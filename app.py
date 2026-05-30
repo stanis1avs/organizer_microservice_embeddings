@@ -1,4 +1,11 @@
-from fastapi import FastAPI, HTTPException
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv не установлен — переменные берутся из окружения
+
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from typing import List, Optional
 import numpy as np
@@ -24,6 +31,17 @@ app = FastAPI(title="Embedding Service")
 MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 NORMALIZE = os.environ.get("EMBEDDING_NORMALIZE", "1") == "1"
 ALLOWED_IMAGE_DIR = os.path.abspath(os.environ.get("ALLOWED_IMAGE_DIR", "/app/files"))
+
+# S-05: API-ключ для защиты эндпоинтов.
+# Если EMBEDDING_API_KEY не задан — проверка отключена (обратная совместимость).
+EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def _verify_api_key(api_key: Optional[str] = Security(_api_key_header)):
+    if not EMBEDDING_API_KEY:
+        return
+    if api_key != EMBEDDING_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 # P: выделенный thread pool для inference.
 # Дефолт 2 — не перегружает CPU при параллельных запросах.
@@ -122,7 +140,7 @@ async def health():
     return {"status": "ok", "cache_size": len(_embed_cache._d)}
 
 
-@app.post("/embed", response_model=EmbedResponse)
+@app.post("/embed", response_model=EmbedResponse, dependencies=[Depends(_verify_api_key)])
 async def embed_text(req: EmbedRequest):
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty text")
@@ -152,7 +170,7 @@ async def embed_text(req: EmbedRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/embed-image", response_model=ImageEmbedResponse)
+@app.post("/embed-image", response_model=ImageEmbedResponse, dependencies=[Depends(_verify_api_key)])
 async def embed_image(req: ImageEmbedRequest):
     try:
         if req.image_path:
