@@ -1,6 +1,7 @@
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    import os as _os
+    load_dotenv(dotenv_path=_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".env"), override=True)
 except ImportError:
     pass  # python-dotenv не установлен — переменные берутся из окружения
 
@@ -28,7 +29,7 @@ from torchvision import models
 logger = logging.getLogger("uvicorn")
 app = FastAPI(title="Embedding Service")
 
-MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 NORMALIZE = os.environ.get("EMBEDDING_NORMALIZE", "1") == "1"
 ALLOWED_IMAGE_DIR = os.path.abspath(os.environ.get("ALLOWED_IMAGE_DIR", "/app/files"))
 
@@ -137,7 +138,7 @@ async def warmup():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "cache_size": len(_embed_cache._d)}
+    return {"status": "ok", "model": MODEL_NAME, "cache_size": len(_embed_cache._d)}
 
 
 @app.post("/embed", response_model=EmbedResponse, dependencies=[Depends(_verify_api_key)])
