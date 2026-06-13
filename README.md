@@ -3,12 +3,13 @@
 Новые фичи приложения [тут](https://github.com/users/stanis1avs/projects/1)
 
 [frontend](https://github.com/Stanislavsus-prj/organizer_frontend) 
-[backend](https://github.com/Stanislavsus-prj/organizer_backend) 
-[Функционал работы приложения](https://github.com/stanis1avs/organizer_frontend/blob/main/FUNCTIONAL.md)
+[backend](https://github.com/Stanislavsus-prj/organizer_backend)
 
 ## О проекте
 
-**Organizer** — система для организации личных данных с умным мультимодальным поиском.
+**Organizer** — система для организации личных данных с умным мультимодальным поиском. 
+
+![f](https://github.com/stanis1avs/organizer_frontend/blob/main/readme_files/ui.jpg?raw=true)
 
 ### Основная функциональность:
 - Сохранение текстовых сообщений
