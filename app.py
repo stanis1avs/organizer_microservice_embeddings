@@ -30,8 +30,11 @@ logger = logging.getLogger("uvicorn")
 app = FastAPI(title="Embedding Service")
 
 MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+CLIP_MODEL_NAME = os.environ.get("CLIP_MODEL", "clip-ViT-B-32")
 NORMALIZE = os.environ.get("EMBEDDING_NORMALIZE", "1") == "1"
 ALLOWED_IMAGE_DIR = os.path.abspath(os.environ.get("ALLOWED_IMAGE_DIR", "/app/files"))
+_ALLOWED_IMAGE_DIR_NORM = os.path.normcase(ALLOWED_IMAGE_DIR)
+print("ALLOWED_IMAGE_DIR:", ALLOWED_IMAGE_DIR)
 
 # S-05: API-ключ для защиты эндпоинтов.
 # Если EMBEDDING_API_KEY не задан — проверка отключена (обратная совместимость).
@@ -70,11 +73,16 @@ class _LRUCache:
             self._d.popitem(last=False)
 
 _embed_cache = _LRUCache(maxsize=int(os.environ.get("EMBED_CACHE_SIZE", "512")))
+_clip_cache = _LRUCache(maxsize=int(os.environ.get("EMBED_CACHE_SIZE", "512")))
 
 # Load models
 print("Loading text model:", MODEL_NAME)
 text_model = SentenceTransformer(MODEL_NAME)
 print("Text model loaded.")
+
+print("Loading CLIP model:", CLIP_MODEL_NAME)
+clip_model = SentenceTransformer(CLIP_MODEL_NAME)
+print("CLIP model loaded.")
 
 print("Loading image model...")
 image_model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
@@ -108,6 +116,10 @@ class ImageEmbedResponse(BaseModel):
     size: int
 
 
+def _is_path_allowed(path_str: str) -> bool:
+    norm = os.path.normcase(os.path.abspath(path_str))
+    return norm.startswith(_ALLOWED_IMAGE_DIR_NORM + os.sep) or norm == _ALLOWED_IMAGE_DIR_NORM
+
 def normalize_vec(v: np.ndarray) -> list:
     norm = np.linalg.norm(v)
     if norm == 0:
@@ -122,6 +134,12 @@ def _run_image_inference(image_tensor: torch.Tensor) -> np.ndarray:
         features = image_model(image_tensor)
     return features.squeeze().numpy()
 
+def _run_clip_text_inference(text: str) -> np.ndarray:
+    return clip_model.encode(text, show_progress_bar=False)
+
+def _run_clip_image_inference(image) -> np.ndarray:
+    return clip_model.encode(image, show_progress_bar=False)
+
 
 @app.on_event("startup")
 async def warmup():
@@ -131,6 +149,7 @@ async def warmup():
         await loop.run_in_executor(_executor, partial(_run_text_inference, "warmup"))
         dummy = torch.zeros(1, 3, 224, 224)
         await loop.run_in_executor(_executor, partial(_run_image_inference, dummy))
+        await loop.run_in_executor(_executor, partial(_run_clip_text_inference, "warmup"))
         logger.info("Models warmed up.")
     except Exception as e:
         logger.warning("Warmup failed (non-critical): %s", e)
@@ -175,10 +194,10 @@ async def embed_text(req: EmbedRequest):
 async def embed_image(req: ImageEmbedRequest):
     try:
         if req.image_path:
-            abs_path = os.path.abspath(req.image_path)
-            if not abs_path.startswith(ALLOWED_IMAGE_DIR + os.sep) and abs_path != ALLOWED_IMAGE_DIR:
+            if not _is_path_allowed(req.image_path):
                 logger.warning("Blocked image_path outside allowed dir: %s", req.image_path)
                 raise HTTPException(status_code=403, detail="Access to this path is not allowed")
+            abs_path = os.path.abspath(req.image_path)
             if not os.path.isfile(abs_path):
                 raise HTTPException(status_code=404, detail="Image file not found")
             image = Image.open(abs_path).convert("RGB")
@@ -210,6 +229,64 @@ async def embed_image(req: ImageEmbedRequest):
         raise
     except Exception as e:
         logger.exception("Image embedding failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ClipEmbedRequest(BaseModel):
+    text: Optional[str] = None
+    image_path: Optional[str] = None
+    image_data: Optional[str] = None  # base64
+
+class ClipEmbedResponse(BaseModel):
+    embedding: List[float]
+    size: int
+    modality: str  # "text" or "image"
+
+
+@app.post("/embed-clip", response_model=ClipEmbedResponse, dependencies=[Depends(_verify_api_key)])
+async def embed_clip(req: ClipEmbedRequest):
+    loop = asyncio.get_running_loop()
+    try:
+        if req.text:
+            cache_key = "clip:" + hashlib.md5(req.text.encode("utf-8")).hexdigest()
+            cached = _clip_cache.get(cache_key)
+            if cached is not None:
+                return {"embedding": cached, "size": len(cached), "modality": "text"}
+            vec_raw = await loop.run_in_executor(_executor, partial(_run_clip_text_inference, req.text))
+            modality = "text"
+        elif req.image_data:
+            if len(req.image_data) > 28_000_000:
+                raise HTTPException(status_code=413, detail="image_data too large (max ~20MB)")
+            image_bytes = base64.b64decode(req.image_data)
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            vec_raw = await loop.run_in_executor(_executor, partial(_run_clip_image_inference, image))
+            modality = "image"
+            cache_key = None
+        elif req.image_path:
+            if not _is_path_allowed(req.image_path):
+                logger.warning("Blocked image_path outside allowed dir: %s", req.image_path)
+                raise HTTPException(status_code=403, detail="Access to this path is not allowed")
+            abs_path = os.path.abspath(req.image_path)
+            if not os.path.isfile(abs_path):
+                raise HTTPException(status_code=404, detail="Image file not found")
+            image = Image.open(abs_path).convert("RGB")
+            vec_raw = await loop.run_in_executor(_executor, partial(_run_clip_image_inference, image))
+            modality = "image"
+            cache_key = None
+        else:
+            raise HTTPException(status_code=400, detail="Provide text, image_path, or image_data")
+
+        vec = normalize_vec(np.array(vec_raw)) if NORMALIZE else np.array(vec_raw).tolist()
+        final = vec.tolist() if isinstance(vec, np.ndarray) else vec
+
+        if cache_key:
+            _clip_cache.put(cache_key, final)
+
+        return {"embedding": final, "size": len(final), "modality": modality}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("CLIP embedding failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
